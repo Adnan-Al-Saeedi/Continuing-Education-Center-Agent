@@ -1,0 +1,854 @@
+/**
+ * المساعد الرقمي لمركز التعليم المستمر - التطبيق الرئيسي
+ * Digital Assistant for Continuing Education Center
+ * 
+ * @license Apache-2.0
+ */
+
+import React, { useState, useEffect, useMemo } from 'react';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { Header } from './components/Header';
+import { Sidebar, TabType } from './components/Sidebar';
+import { DashboardTab } from './components/DashboardTab';
+import { ActivitiesTab } from './components/ActivitiesTab';
+import { DocumentsTab } from './components/DocumentsTab';
+import { TemplateTab } from './components/TemplateTab';
+import { SendLogTab } from './components/SendLogTab';
+import { SettingsTab } from './components/SettingsTab';
+import { DateConflictModal } from './components/DateConflictModal';
+import { AuthModal } from './components/AuthModal';
+import { DispatchModal } from './components/DispatchModal';
+
+import { 
+  Activity, 
+  Lecturer, 
+  Settings, 
+  DocumentItem, 
+  EmailTemplate, 
+  SendLog, 
+  SendStatus,
+  NameAlias,
+  DateConflictItem,
+  UnmatchedLecturer,
+  AppNotification
+} from './types';
+
+import { 
+  localStore, 
+  getSupabaseClient,
+  INITIAL_DOCUMENTS
+} from './lib/supabase';
+
+import { 
+  normalizeArabic, 
+  calculateSimilarity, 
+  splitLecturerNames, 
+  isDateReversed 
+} from './lib/arabicUtils';
+
+import { composeEmail, composeWhatsAppMessage } from './lib/emailComposer';
+import { 
+  sendTestEmail, 
+  sendActualEmail, 
+  sendBrowserNotification 
+} from './lib/emailService';
+import { ShieldAlert } from 'lucide-react';
+
+function MainApp() {
+  const { isAuthenticated, admin } = useAuth();
+  const isSuperAdmin = Boolean(admin?.isSuperAdmin || admin?.role === 'super_admin');
+
+  // الحالة العامة للتطبيق
+  const [currentTab, setCurrentTab] = useState<TabType>('dashboard');
+
+  // حصر الوصول إلى الإعدادات العامة بالـ Super Admin فقط
+  useEffect(() => {
+    if (!isSuperAdmin && currentTab === 'settings') {
+      setCurrentTab('dashboard');
+    }
+  }, [isSuperAdmin, currentTab]);
+  const [settings, setSettings] = useState<Settings>(localStore.getSettings);
+  const [activities, setActivities] = useState<Activity[]>(localStore.getActivities);
+  const [lecturers, setLecturers] = useState<Lecturer[]>(localStore.getLecturers);
+  const [documents, setDocuments] = useState<DocumentItem[]>(localStore.getDocuments);
+  const [template, setTemplate] = useState<EmailTemplate>(localStore.getTemplate);
+  const [aliases, setAliases] = useState<NameAlias[]>(localStore.getAliases);
+  const [sendLogs, setSendLogs] = useState<SendLog[]>(localStore.getSendLogs);
+  const [notifications, setNotifications] = useState<AppNotification[]>(localStore.getNotifications);
+
+  const [isConflictModalOpen, setIsConflictModalOpen] = useState<boolean>(false);
+  const [isDispatchModalOpen, setIsDispatchModalOpen] = useState<boolean>(false);
+  const [dispatchTargetActivity, setDispatchTargetActivity] = useState<Activity | null>(null);
+  const [isSendingNow, setIsSendingNow] = useState<boolean>(false);
+  const [notification, setNotification] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  const handleOpenDispatchCenter = (activity?: Activity) => {
+    setDispatchTargetActivity(activity || null);
+    setIsDispatchModalOpen(true);
+  };
+
+  const showNotification = (text: string, type: 'success' | 'error' | 'info' = 'success') => {
+    setNotification({ text, type });
+    setTimeout(() => setNotification(null), 5000);
+  };
+
+  const addAppNotification = (title: string, message: string, type: 'success' | 'info' | 'warning' | 'error' = 'info') => {
+    const item = localStore.addNotification({ title, message, type });
+    setNotifications((prev) => [item, ...prev.slice(0, 49)]);
+    showNotification(message, type === 'warning' ? 'error' : type);
+  };
+
+  const handleClearNotifications = () => {
+    localStore.setNotifications([]);
+    setNotifications([]);
+  };
+
+  const handleMarkAllNotificationsRead = () => {
+    const updated = notifications.map((n) => ({ ...n, read: true }));
+    localStore.setNotifications(updated);
+    setNotifications(updated);
+  };
+
+  // المزامنة مع التخزين المحلي عند التحديث
+  useEffect(() => {
+    localStore.setSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    localStore.setActivities(activities);
+  }, [activities]);
+
+  useEffect(() => {
+    localStore.setLecturers(lecturers);
+  }, [lecturers]);
+
+  useEffect(() => {
+    localStore.setDocuments(documents);
+  }, [documents]);
+
+  useEffect(() => {
+    localStore.setTemplate(template);
+  }, [template]);
+
+  useEffect(() => {
+    localStore.setAliases(aliases);
+  }, [aliases]);
+
+  useEffect(() => {
+    localStore.setSendLogs(sendLogs);
+  }, [sendLogs]);
+
+  // 1. حساب تعارضات التواريخ المعكوسة (Start Date > End Date)
+  const dateConflicts = useMemo<DateConflictItem[]>(() => {
+    const list: DateConflictItem[] = [];
+    activities.forEach((act) => {
+      if (isDateReversed(act.start_date, act.end_date)) {
+        list.push({
+          activityId: act.id,
+          title: act.title,
+          type: act.type,
+          department: act.department,
+          originalStart: act.start_date,
+          originalEnd: act.end_date,
+          correctedStart: act.end_date,
+          correctedEnd: act.start_date,
+        });
+      }
+    });
+    return list;
+  }, [activities]);
+
+  // 2. خريطة الأسماء البديلة المحفوظة (Normalized Raw -> Lecturer ID)
+  const aliasMap = useMemo(() => {
+    const map = new Map<string, string>();
+    aliases.forEach((a) => {
+      map.set(normalizeArabic(a.raw_name), a.lecturer_id);
+    });
+    return map;
+  }, [aliases]);
+
+  // 3. حساب المحاضرين غير المطابقين (المستخرجين من الأنشطة ولا يوجد لهم بريد)
+  const unmatchedLecturers = useMemo<UnmatchedLecturer[]>(() => {
+    const unmatchedMap = new Map<string, UnmatchedLecturer>();
+
+    activities.forEach((act) => {
+      const names = splitLecturerNames(act.lecturers_raw);
+
+      names.forEach((rawName) => {
+        const normRaw = normalizeArabic(rawName);
+        if (!normRaw) return;
+
+        // فحص وجود تطابق مباشر أو بديل
+        let matched = false;
+        if (aliasMap.has(normRaw)) {
+          const lecId = aliasMap.get(normRaw);
+          if (lecturers.some((l) => l.id === lecId && l.email)) {
+            matched = true;
+          }
+        }
+
+        if (!matched) {
+          const directLec = lecturers.find(
+            (l) => l.normalized_name === normRaw || normalizeArabic(l.full_name) === normRaw
+          );
+          if (directLec && directLec.email) {
+            matched = true;
+          }
+        }
+
+        if (!matched && !unmatchedMap.has(normRaw)) {
+          // حساب أفضل 3 اقتراحات تطابق تقريبي (Fuzzy Matching)
+          const suggestions = lecturers
+            .map((lec) => ({
+              lecturer: lec,
+              similarity: calculateSimilarity(rawName, lec.full_name),
+            }))
+            .filter((s) => s.similarity >= 35)
+            .sort((a, b) => b.similarity - a.similarity)
+            .slice(0, 3);
+
+          unmatchedMap.set(normRaw, {
+            raw_name: rawName,
+            normalized_raw: normRaw,
+            activity_title: act.title,
+            department: act.department,
+            activity_id: act.id,
+            suggestions,
+          });
+        }
+      });
+    });
+
+    return Array.from(unmatchedMap.values());
+  }, [activities, lecturers, aliasMap]);
+
+  // معالجة تبديل التاريخين المعكوسين تلقائياً للكل
+  const handleApplyAllSwaps = () => {
+    setActivities((prev) =>
+      prev.map((act) => {
+        if (isDateReversed(act.start_date, act.end_date)) {
+          return {
+            ...act,
+            start_date: act.end_date,
+            end_date: act.start_date,
+            date_fixed: true,
+          };
+        }
+        return act;
+      })
+    );
+    setIsConflictModalOpen(false);
+    showNotification(`تم تصحيح وتبديل تواريخ ${dateConflicts.length} نشاط بنجاح مع اعتماد التاريخ الأقدم للبدء.`);
+  };
+
+  // معالجة تعديل تاريخ تعارض مفرد
+  const handleUpdateConflict = (activityId: string, start: string, end: string) => {
+    setActivities((prev) =>
+      prev.map((act) => {
+        if (act.id === activityId) {
+          return {
+            ...act,
+            start_date: start,
+            end_date: end,
+            date_fixed: true,
+          };
+        }
+        return act;
+      })
+    );
+    showNotification('تم تحديث تاريخ النشاط.');
+  };
+
+  // ربط وحفظ اسم بديل (Alias)
+  const handleBindAlias = (rawName: string, lecturerId: string) => {
+    const existingIndex = aliases.findIndex((a) => a.raw_name === rawName);
+    if (existingIndex >= 0) {
+      const updated = [...aliases];
+      updated[existingIndex] = { raw_name: rawName, lecturer_id: lecturerId };
+      setAliases(updated);
+    } else {
+      setAliases((prev) => [...prev, { raw_name: rawName, lecturer_id: lecturerId }]);
+    }
+
+    const lecturer = lecturers.find((l) => l.id === lecturerId);
+    showNotification(`تم ربط «${rawName}» بالمحاضر «${lecturer?.full_name}» وحفظ الاسم البديل للمستقبل.`);
+  };
+
+  // استيراد الأنشطة من ملف Excel
+  const handleImportActivities = (imported: Activity[], newConflicts: DateConflictItem[]) => {
+    setActivities((prev) => {
+      // دمج وتحديث السجلات الموجودة بدون تكرار
+      const existingMap = new Map<string, Activity>();
+      prev.forEach((a) => existingMap.set(`${a.type}-${a.title}-${a.start_date}`, a));
+
+      imported.forEach((a) => {
+        existingMap.set(`${a.type}-${a.title}-${a.start_date}`, a);
+      });
+
+      return Array.from(existingMap.values());
+    });
+
+    if (newConflicts.length > 0) {
+      setIsConflictModalOpen(true);
+    }
+  };
+
+  // استعادة خطة كلية البوليتكنك - بابل الرسمية
+  const handleReloadPolytechnic = () => {
+    localStore.resetToPolytechnic();
+    setSettings(localStore.getSettings());
+    setActivities(localStore.getActivities());
+    setLecturers(localStore.getLecturers());
+    setAliases(localStore.getAliases());
+    showNotification('تم استرجاع خطة كلية البوليتكنك - بابل (2026-2027) الرسمية بنجاح!');
+  };
+
+  // تفعيل / إيقاف خدمة الواتساب الفورية المتزامنة مع البريد
+  // تبديل حالة خدمة الرسائل العامة (تشغيل / إيقاف مؤقت)
+  const handleToggleMessagingService = () => {
+    setSettings((prev) => {
+      const updated: Settings = {
+        ...prev,
+        messaging_service_active: !prev.messaging_service_active,
+      };
+      localStore.setSettings(updated);
+      showNotification(
+        updated.messaging_service_active
+          ? 'تم تشغيل خدمة الرسائل والتذكيرات الآلية بنجاح 🔔'
+          : 'تم إيقاف خدمة الرسائل والتذكيرات الآلية مؤقتاً ⏸️',
+        updated.messaging_service_active ? 'success' : 'info'
+      );
+      return updated;
+    });
+  };
+
+  // تبديل حالة خدمة رسائل البريد الإلكتروني (تشغيل / إيقاف)
+  const handleToggleEmail = () => {
+    setSettings((prev) => {
+      const updated: Settings = {
+        ...prev,
+        email_enabled: !prev.email_enabled,
+      };
+      localStore.setSettings(updated);
+      showNotification(
+        updated.email_enabled
+          ? 'تم تفعيل خدمة رسائل البريد الإلكتروني بنجاح 📧'
+          : 'تم إيقاف خدمة رسائل البريد الإلكتروني مؤقتاً ⚪',
+        updated.email_enabled ? 'success' : 'info'
+      );
+      return updated;
+    });
+  };
+
+  // تبديل حالة خدمة الواتساب (تشغيل / إيقاف)
+  const handleToggleWhatsApp = () => {
+    setSettings((prev) => {
+      const updated: Settings = {
+        ...prev,
+        whatsapp_enabled: !prev.whatsapp_enabled,
+      };
+      localStore.setSettings(updated);
+      showNotification(
+        updated.whatsapp_enabled
+          ? 'تم تفعيل خدمة رسائل الواتساب بنجاح 💬: سيتم إرسال التذكيرات عبر واتساب بالتزامن مع البريد.'
+          : 'تم إيقاف تفعيل خدمة الواتساب مؤقتاً ⚪: سيتم الاكتفاء بالقنوات المفعّلة الأخرى.',
+        updated.whatsapp_enabled ? 'success' : 'info'
+      );
+      return updated;
+    });
+  };
+
+  // تنفيذ منطق الإرسال التلقائي أو الفوري (بريد إلكتروني + واتساب بالتزامن وفق القنوات المفعّلة)
+  const handleSendNow = async () => {
+    if (!settings.messaging_service_active) {
+      showNotification('خدمة الرسائل والتذكيرات متوقفة حالياً. يرجى تفعيل خدمة الرسائل أولاً.', 'info');
+      return;
+    }
+
+    if (!settings.email_enabled && !settings.whatsapp_enabled) {
+      showNotification('كلا خدمتي البريد الإلكتروني والواتساب معطلتان حالياً. يرجى تشغيل قناة واحدة على الأقل قبل الإرسال.', 'error');
+      return;
+    }
+
+    setIsSendingNow(true);
+    showNotification(
+      settings.email_enabled && settings.whatsapp_enabled
+        ? 'جارٍ فحص الأنشطة المستحقة وإرسال التذكيرات عبر البريد الإلكتروني والواتساب في نفس الوقت...'
+        : settings.email_enabled
+        ? 'جارٍ فحص الأنشطة المستحقة وإرسال التذكيرات عبر البريد الإلكتروني...'
+        : 'جارٍ فحص الأنشطة المستحقة وإرسال التذكيرات عبر الواتساب...',
+      'info'
+    );
+
+    // تاريخ اليوم + تاريخ الاستحقاق
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    const targetDate = new Date();
+    targetDate.setDate(targetDate.getDate() + settings.days_before);
+    const targetDateStr = targetDate.toISOString().split('T')[0];
+
+    // استخراج الأنشطة التي تبدأ في هذا النطاق
+    const eligibleActivities = activities.filter(
+      (a) => a.start_date >= todayStr && a.start_date <= targetDateStr
+    );
+
+    if (eligibleActivities.length === 0) {
+      setIsSendingNow(false);
+      const msg = `لا توجد أنشطة مستحقة تبدأ خلال الـ ${settings.days_before} أيام القادمة (بين ${todayStr} و ${targetDateStr}).`;
+      addAppNotification('فحص التذكيرات المستحقة', msg, 'info');
+      sendBrowserNotification('📅 فحص الأنشطة المستحقة', { body: msg });
+      return;
+    }
+
+    let sentEmail = 0;
+    let sentWhatsApp = 0;
+    let failed = 0;
+    let missingEmail = 0;
+    let skipped = 0;
+
+    const newLogs: SendLog[] = [];
+
+    for (const act of eligibleActivities) {
+      const names = splitLecturerNames(act.lecturers_raw);
+
+      for (const rawName of names) {
+        const normRaw = normalizeArabic(rawName);
+
+        // البحث عن المحاضر: الأولوية للبيانات المضمنة مباشرة في النشاط
+        let matchedLec: Lecturer | null = null;
+        if (act.lecturer_email) {
+          matchedLec = {
+            id: `lec-${act.id}`,
+            full_name: act.lecturer_name || rawName,
+            normalized_name: normalizeArabic(act.lecturer_name || rawName),
+            title: act.lecturer_title,
+            department: act.department,
+            email: act.lecturer_email,
+            phone: act.lecturer_phone,
+          };
+        } else {
+          if (aliasMap.has(normRaw)) {
+            matchedLec = lecturers.find((l) => l.id === aliasMap.get(normRaw)) || null;
+          }
+          if (!matchedLec) {
+            matchedLec = lecturers.find(
+              (l) => l.normalized_name === normRaw || normalizeArabic(l.full_name) === normRaw
+            ) || null;
+          }
+        }
+
+        if (!matchedLec || !matchedLec.email) {
+          missingEmail++;
+          continue;
+        }
+
+        // فحص هل أُرسل سابقاً
+        const alreadySent = sendLogs.some(
+          (log) =>
+            log.activity_id === act.id &&
+            log.lecturer_id === matchedLec.id &&
+            log.reminder_type === 'first' &&
+            log.status === 'sent'
+        );
+
+        if (alreadySent) {
+          skipped++;
+          continue;
+        }
+
+        const others = names.filter((n) => n !== rawName);
+        const emailData = composeEmail(act, matchedLec, others, settings, template, documents);
+
+        let emailStatus: SendStatus = 'sent';
+        let emailError: string | undefined = undefined;
+
+        // إرسال البريد الإلكتروني الفعلي
+        if (settings.email_enabled) {
+          const sendRes = await sendActualEmail({
+            to: matchedLec.email,
+            subject: emailData.subject,
+            html: emailData.html,
+            settings,
+          });
+
+          if (sendRes.success) {
+            sentEmail++;
+          } else {
+            failed++;
+            emailStatus = 'failed';
+            emailError = sendRes.message;
+          }
+        }
+
+        // إرسال وتجهيز رسالة الواتساب بنفس الوقت عند تفعيل خدمة الواتساب
+        const phone = act.lecturer_phone || matchedLec.phone || '';
+        let whatsappUrl: string | undefined = undefined;
+        let whatsappStatus: SendStatus | undefined = undefined;
+
+        if (settings.whatsapp_enabled) {
+          const wa = composeWhatsAppMessage(
+            act,
+            matchedLec.full_name,
+            matchedLec.title,
+            phone,
+            settings,
+            documents,
+            template,
+            others
+          );
+          whatsappUrl = wa.whatsappUrl;
+          whatsappStatus = 'sent';
+          sentWhatsApp++;
+        }
+
+        const channelMode: 'email' | 'whatsapp' | 'both' = 
+          (settings.email_enabled && settings.whatsapp_enabled) ? 'both' : (settings.email_enabled ? 'email' : 'whatsapp');
+
+        const overallStatus: SendStatus = (settings.email_enabled && emailStatus === 'failed') ? 'failed' : 'sent';
+
+        // تسجيل العملية في سجل الإرسال (Send Log)
+        const logItem: SendLog = {
+          id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+          activity_id: act.id,
+          activity_title: act.title,
+          activity_type: act.type,
+          lecturer_id: matchedLec.id,
+          recipient_name: matchedLec.full_name,
+          email: matchedLec.email,
+          phone: phone || undefined,
+          reminder_type: 'first',
+          status: overallStatus,
+          error: emailError,
+          channel: channelMode,
+          whatsapp_status: whatsappStatus,
+          whatsapp_url: whatsappUrl,
+          attempts: 1,
+          sent_at: new Date().toISOString(),
+        };
+
+        newLogs.push(logItem);
+      }
+    }
+
+    if (newLogs.length > 0) {
+      setSendLogs((prev) => [...newLogs, ...prev]);
+    }
+
+    setIsSendingNow(false);
+    const summaryMsg = settings.email_enabled && settings.whatsapp_enabled
+      ? `اكتمل الإرسال المزدوج: تم إرسال ${sentEmail} بريد إلكتروني، وتجهيز ${sentWhatsApp} رسالة واتساب، وفشل ${failed} (تخطي ${skipped} مكررة).`
+      : settings.email_enabled
+      ? `اكتمل الإرسال: تم إرسال ${sentEmail} بريد إلكتروني، وفشل ${failed} (تخطي ${skipped} مكررة).`
+      : `اكتمل الإرسال: تم تجهيز ${sentWhatsApp} رسالة واتساب بنجاح (تخطي ${skipped} مكررة).`;
+
+    addAppNotification('تقرير إرسال التذكيرات', summaryMsg, failed > 0 ? 'warning' : 'success');
+    sendBrowserNotification('🔔 تقرير إرسال التذكيرات', { body: summaryMsg });
+  };
+
+  // إرسال بريد تجريبي فعلي إلى بريد مسؤول النظام
+  const handleSendTestEmail = async (
+    testEmail: string, 
+    testSubject: string, 
+    testHtml: string
+  ): Promise<{ success: boolean; message: string; previewUrl?: string }> => {
+    const result = await sendTestEmail({
+      to: testEmail,
+      subject: testSubject,
+      html: testHtml,
+      settings,
+    });
+
+    const logItem: SendLog = {
+      id: `log-test-${Date.now()}`,
+      activity_id: activities[0]?.id || 'test-act',
+      activity_title: 'إرسال بريد تجريبي لمعاينة القالب',
+      activity_type: 'course',
+      recipient_name: 'مسؤول النظام (تجريبي)',
+      email: testEmail,
+      reminder_type: 'manual',
+      status: result.success ? 'sent' : 'failed',
+      error: result.success ? undefined : result.message,
+      attempts: 1,
+      sent_at: new Date().toISOString(),
+    };
+
+    setSendLogs((prev) => [logItem, ...prev]);
+
+    if (result.success) {
+      addAppNotification('بريد تجريبي ناجح 📧', `تم إرسال البريد التجريبي بنجاح إلى: ${testEmail}`, 'success');
+      sendBrowserNotification('📧 بريد تجريبي صادر', {
+        body: `تم إرسال بريد تجريبي لقالب التذكير بنجاح إلى: ${testEmail}`,
+      });
+    } else {
+      addAppNotification('فحص إرسال البريد التجريبي', result.message, 'warning');
+      sendBrowserNotification('⚠️ تنبيه بخصوص البريد التجريبي', {
+        body: result.message,
+      });
+    }
+
+    return result;
+  };
+
+  // إعادة إرسال رسالة فاشلة
+  const handleRetrySend = async (logId: string) => {
+    const log = sendLogs.find((l) => l.id === logId);
+    if (!log) return;
+
+    let resSuccess = true;
+    let resError: string | undefined = undefined;
+
+    if (log.email) {
+      const act = activities.find((a) => a.id === log.activity_id) || activities[0];
+      const lec: Lecturer = {
+        id: log.lecturer_id || 'lec',
+        full_name: log.recipient_name,
+        normalized_name: normalizeArabic(log.recipient_name),
+        department: '',
+        email: log.email,
+        phone: log.phone,
+      };
+
+      const emailData = composeEmail(act, lec, [], settings, template, documents);
+      const res = await sendActualEmail({
+        to: log.email,
+        subject: emailData.subject,
+        html: emailData.html,
+        settings,
+      });
+      resSuccess = res.success;
+      resError = res.success ? undefined : res.message;
+    }
+
+    setSendLogs((prev) =>
+      prev.map((item) => {
+        if (item.id === logId) {
+          return {
+            ...item,
+            status: resSuccess ? 'sent' : 'failed',
+            error: resError,
+            attempts: item.attempts + 1,
+            sent_at: new Date().toISOString(),
+          };
+        }
+        return item;
+      })
+    );
+
+    if (resSuccess) {
+      addAppNotification('إعادة إرسال ناجحة', `تمت إعادة إرسال التذكير بنجاح إلى: ${log.recipient_name}`, 'success');
+      sendBrowserNotification('✅ إعادة إرسال ناجحة', {
+        body: `تمت إعادة إرسال التذكير بنجاح إلى: ${log.recipient_name}`,
+      });
+    } else {
+      showNotification(`تعذر إعادة الإرسال: ${resError}`, 'error');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#f5f5f7] flex flex-col font-['Cairo',sans-serif] text-[#1d1d1f]">
+      
+      {/* نافذة التحقق والمصادقة الإلزامية للمسؤول */}
+      <AuthModal />
+
+      {/* الترويسة الرئيسية */}
+      <Header 
+        settings={settings} 
+        onSendNow={() => handleOpenDispatchCenter()} 
+        isSending={isSendingNow}
+        notifications={notifications}
+        onClearNotifications={handleClearNotifications}
+        onMarkAllNotificationsRead={handleMarkAllNotificationsRead}
+      />
+
+      {/* شريط الإشعارات المنبثقة */}
+      {notification && (
+        <div className="fixed bottom-5 left-5 z-50 animate-in slide-in-from-bottom-5">
+          <div className={`px-4 py-3 rounded-2xl shadow-xl text-xs font-bold text-white flex items-center gap-2.5 ${
+            notification.type === 'error' 
+              ? 'bg-rose-600 shadow-rose-600/20' 
+              : notification.type === 'info' 
+              ? 'bg-slate-900' 
+              : 'bg-gradient-to-r from-blue-950 to-blue-900 border border-blue-800/30 shadow-blue-950/20'
+          }`}>
+            <span>{notification.text}</span>
+          </div>
+        </div>
+      )}
+
+      {/* جسم الصفحة الرئيسي */}
+      <div className="flex-1 flex max-w-7xl w-full mx-auto">
+        
+        {/* القائمة الجانبية RTL */}
+        <Sidebar
+          currentTab={currentTab}
+          onSelectTab={setCurrentTab}
+          conflictsCount={dateConflicts.length}
+        />
+
+        {/* مساحة المحتوى للتبويب النشط */}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto">
+          {currentTab === 'dashboard' && (
+            <DashboardTab
+              activities={activities}
+              sendLogs={sendLogs}
+              settings={settings}
+              conflictsCount={dateConflicts.length}
+              onNavigateToActivities={() => setCurrentTab('activities')}
+              onNavigateToLogs={() => setCurrentTab('logs')}
+              onSendNow={() => handleOpenDispatchCenter()}
+              isSending={isSendingNow}
+              onToggleWhatsApp={handleToggleWhatsApp}
+              onToggleEmail={handleToggleEmail}
+              onToggleMessagingService={handleToggleMessagingService}
+            />
+          )}
+
+          {currentTab === 'activities' && (
+            <ActivitiesTab
+              activities={activities}
+              conflicts={dateConflicts}
+              settings={settings}
+              documents={documents}
+              dataSourceUrl={settings.data_source_url}
+              lastSyncTime={settings.last_sync_time}
+              onImportActivities={handleImportActivities}
+              onAddActivity={(act) => setActivities((prev) => [act, ...prev])}
+              onUpdateActivity={(act) =>
+                setActivities((prev) => prev.map((a) => (a.id === act.id ? act : a)))
+              }
+              onDeleteActivity={(id) =>
+                setActivities((prev) => prev.filter((a) => a.id !== id))
+              }
+              onClearAllActivities={() => {
+                setActivities([]);
+                showNotification('تم حذف جميع النشاطات بنجاح.', 'info');
+              }}
+              onOpenConflicts={() => setIsConflictModalOpen(true)}
+              onOpenDispatch={(act) => handleOpenDispatchCenter(act)}
+              onUpdateDataSourceUrl={(url) =>
+                setSettings((prev) => ({
+                  ...prev,
+                  data_source_url: url,
+                  last_sync_time: new Date().toISOString(),
+                }))
+              }
+              onReloadPolytechnic={handleReloadPolytechnic}
+            />
+          )}
+
+          {currentTab === 'documents' && (
+            <DocumentsTab
+              documents={documents}
+              onAddDocument={(doc) => {
+                setDocuments((prev) => [doc, ...prev]);
+                showNotification(`تمت إضافة نموذج «${doc.name}» بنجاح.`);
+              }}
+              onUpdateDocument={(updatedDoc) => {
+                setDocuments((prev) =>
+                  prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+                );
+                showNotification(`تم حفظ تعديل نموذج «${updatedDoc.name}» بنجاح.`);
+              }}
+              onDeleteDocument={(id) => {
+                const target = documents.find((d) => d.id === id);
+                setDocuments((prev) => prev.filter((d) => d.id !== id));
+                showNotification(`تم حذف نموذج «${target?.name || ''}» بنجاح.`);
+              }}
+              onResetDocuments={() => {
+                setDocuments(INITIAL_DOCUMENTS);
+                showNotification('تمت استعادة النماذج الرسمية الافتراضية بنجاح.');
+              }}
+            />
+          )}
+
+          {currentTab === 'template' && (
+            <TemplateTab
+              template={template}
+              activities={activities}
+              lecturers={lecturers}
+              settings={settings}
+              documents={documents}
+              onSaveTemplate={(newTpl) => setTemplate(newTpl)}
+              onSendTestEmail={handleSendTestEmail}
+            />
+          )}
+
+          {currentTab === 'logs' && (
+            <SendLogTab
+              sendLogs={sendLogs}
+              settings={settings}
+              onRetrySend={handleRetrySend}
+              isRetrying={false}
+            />
+          )}
+
+          {currentTab === 'settings' && (
+            isSuperAdmin ? (
+              <SettingsTab
+                settings={settings}
+                onSaveSettings={(newSet) => setSettings(newSet)}
+                onReloadPolytechnic={handleReloadPolytechnic}
+              />
+            ) : (
+              <div className="max-w-md mx-auto my-16 bg-white rounded-3xl p-8 border border-rose-200 text-center shadow-lg shadow-rose-950/5">
+                <div className="w-16 h-16 rounded-2xl bg-rose-50 text-rose-600 border border-rose-200/80 flex items-center justify-center mx-auto mb-4">
+                  <ShieldAlert className="w-8 h-8" />
+                </div>
+                <h2 className="text-base font-bold text-slate-900 mb-2">
+                  صلاحية الوصول للإعدادات العامة مقيدة
+                </h2>
+                <p className="text-xs text-slate-600 leading-relaxed mb-6">
+                  تبويب «الإعدادات العامة» مخصص حصراً لمسؤول النظام العام (Super Admin).
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setCurrentTab('dashboard')}
+                  className="px-5 py-2.5 rounded-xl bg-blue-950 text-white font-bold text-xs hover:bg-blue-900 transition-all cursor-pointer shadow-sm"
+                >
+                  العودة إلى الشاشة الرئيسية
+                </button>
+              </div>
+            )
+          )}
+        </main>
+
+      </div>
+
+      {/* نافذة مراجعة التواريخ المعكوسة */}
+      <DateConflictModal
+        isOpen={isConflictModalOpen}
+        conflicts={dateConflicts}
+        onClose={() => setIsConflictModalOpen(false)}
+        onApplyAllSwaps={handleApplyAllSwaps}
+        onUpdateConflict={handleUpdateConflict}
+      />
+
+      {/* نافذة مركز إرسال التذكيرات للمحاضرين */}
+      <DispatchModal
+        isOpen={isDispatchModalOpen}
+        onClose={() => setIsDispatchModalOpen(false)}
+        activities={activities}
+        targetActivity={dispatchTargetActivity}
+        lecturers={lecturers}
+        aliasMap={aliasMap}
+        settings={settings}
+        template={template}
+        documents={documents}
+        sendLogs={sendLogs}
+        onLogCreated={(log) => {
+          setSendLogs((prev) => [log, ...prev]);
+        }}
+        onNavigateToSettings={isSuperAdmin ? () => setCurrentTab('settings') : undefined}
+      />
+
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <MainApp />
+    </AuthProvider>
+  );
+}
