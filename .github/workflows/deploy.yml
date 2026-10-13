@@ -43,6 +43,11 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
+      - name: Setup GitHub Pages static files (.nojekyll & 404.html)
+        run: |
+          touch dist/.nojekyll
+          cp dist/index.html dist/404.html
+
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
         with:
